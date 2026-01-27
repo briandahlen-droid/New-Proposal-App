@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Output files (generated proposals)
+output/*.docx
+output/*.pdf
+!output/.gitkeep
+
+# Data files (may contain sensitive info)
+data/eContractMaster.xlsm
+data/Proposal Task Tool.xlsx
+data/pinellas_county_cities_lookup.json
+
+# Assets (templates may be proprietary)
+assets/Template.docx
+assets/Template_tokens.docx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
