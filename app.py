@@ -499,34 +499,56 @@ def _pinellas_query_layer(layer_path, params, timeout=20):
     url = f"{PINELLAS_GIS_BASE_URL}/{layer_path}/query"
     return _arcgis_get_json(session, url, params, timeout=timeout)
 
-def _pinellas_try_where(parcel_field, parcel_id):
-    # Parcel IDs are often stored as text; keep as quoted string.
-    safe = str(parcel_id).replace("'", "''")
-    return f"{parcel_field} = '{safe}'"
+def _pinellas_where_variants(parcel_field, parcel_id):
+    """
+    Build a list of WHERE clause variants for common parcel-id formatting cases.
+    Tries:
+      - original value (quoted)
+      - digits-only value (quoted and unquoted if numeric)
+    """
+    pid = str(parcel_id).strip()
+    pid_digits = "".join(ch for ch in pid if ch.isdigit())
+    values = [pid]
+    if pid_digits and pid_digits != pid:
+        values.append(pid_digits)
+
+    wheres = []
+    for v in values:
+        safe = v.replace("'", "''")
+        # Text field form
+        wheres.append(f"{parcel_field} = '{safe}'")
+        # Numeric field form (only if digits)
+        if v.isdigit():
+            wheres.append(f"{parcel_field} = {v}")
+    return wheres
 
 def pinellas_get_parcel_feature(parcel_id):
     """Return first parcel feature (attributes + geometry) from Pinellas parcels service."""
-    # Try common parcel id field names (service-dependent)
-    candidate_fields = ["PARCELID", "PARCEL_ID", "PIN", "APN", "FOLIO", "FOLIO_NUMBER"]
+    candidate_fields = ["PARCELID", "PARCEL_ID", "PIN", "APN", "FOLIO", "FOLIO_NUMBER", "PARCELNO", "PARCEL_NO"]
+
+    last_error = None
     for fld in candidate_fields:
-        try:
-            data = _pinellas_query_layer(
-                PINELLAS_GIS_SERVICES["parcels_layer"],
-                {
-                    "where": _pinellas_try_where(fld, parcel_id),
-                    "outFields": "*",
-                    "returnGeometry": "true",
-                    "outSR": "4326",
-                    "resultRecordCount": 1,
-                },
-            )
-            feats = data.get("features") or []
-            if feats:
-                return {"success": True, "field": fld, "feature": feats[0]}
-        except Exception:
-            # Try next field name
-            continue
-    return {"success": False, "error": "Parcel geometry not found in parcels service"}
+        for where in _pinellas_where_variants(fld, parcel_id):
+            try:
+                data = _pinellas_query_layer(
+                    PINELLAS_GIS_SERVICES["parcels_layer"],
+                    {
+                        "where": where,
+                        "outFields": "*",
+                        "returnGeometry": "true",
+                        # Ask for WGS84, but do not assume it will be honored.
+                        "outSR": "4326",
+                        "resultRecordCount": 1,
+                    },
+                )
+                feats = data.get("features") or []
+                if feats:
+                    return {"success": True, "field": fld, "where": where, "feature": feats[0]}
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+    return {"success": False, "error": "Parcel geometry not found in parcels service", "detail": last_error}
 
 def _polygon_centroid_xy(rings):
     """Compute an area-weighted centroid for the first ring. Falls back to bbox center."""
@@ -573,68 +595,75 @@ def _pick_attr(attrs, keys):
     return None
 
 def pinellas_lookup_zoning_flu_via_parcel_geometry(parcel_id):
-    """Deterministic zoning + FLU lookup: parcel_id -> parcel geometry -> zoning/flum spatial query."""
+    """
+    Deterministic zoning + FLU lookup:
+      parcel_id -> parcel polygon geometry -> zoning/flum spatial query (polygon intersects).
+
+    This avoids centroid edge cases and SR mismatches (we pass the parcel geometry + inSR).
+    """
+    session = get_resilient_session()
     try:
         parcel_res = pinellas_get_parcel_feature(parcel_id)
         if not parcel_res.get("success"):
-            return {"success": False, "error": parcel_res.get("error", "Parcel geometry lookup failed")}
+            return {"success": False, "error": parcel_res.get("error", "Parcel geometry lookup failed"), "_debug": parcel_res}
 
         feature = parcel_res["feature"]
         geom = (feature or {}).get("geometry") or {}
-        rings = geom.get("rings")
-        centroid = _polygon_centroid_xy(rings)
-        if not centroid:
-            return {"success": False, "error": "Unable to compute parcel centroid"}
-        x, y = centroid
+        if not geom:
+            return {"success": False, "error": "Parcel feature returned without geometry", "_debug": parcel_res}
 
-        # Query zoning polygon at centroid point
-        zoning_data = _pinellas_query_layer(
-            PINELLAS_GIS_SERVICES["zoning_layer"],
-            {
-                "geometry": f"{x},{y}",
-                "geometryType": "esriGeometryPoint",
-                "inSR": "4326",
+        # Determine spatial reference of returned geometry
+        sr = (geom.get("spatialReference") or {}).get("wkid") or 4326
+
+        def _poly_query(layer_path):
+            url = f"{PINELLAS_GIS_BASE_URL}/{layer_path}/query"
+            params = {
+                "where": "1=1",
+                "geometry": json.dumps(geom),
+                "geometryType": "esriGeometryPolygon",
+                "inSR": str(sr),
                 "spatialRel": "esriSpatialRelIntersects",
                 "outFields": "*",
                 "returnGeometry": "false",
                 "resultRecordCount": 5,
-            },
-        )
+            }
+            return _arcgis_get_json(session, url, params)
+
+        zoning_data = _poly_query(PINELLAS_GIS_SERVICES["zoning_layer"])
         z_feats = zoning_data.get("features") or []
         z_attrs = (z_feats[0] or {}).get("attributes") if z_feats else {}
 
         zoning_code = _pick_attr(z_attrs or {}, [
-            "ZONING", "Zoning", "ZONING_CLASSIFICATION", "ZONING_CLASS", "CLASSNAME", "ClassName"
+            "ZONING", "Zoning", "ZONING_CLASSIFICATION", "ZONING_CLASS", "ZONINGCODE",
+            "DISTRICT", "ZONE", "CLASSNAME", "ClassName"
         ])
         zoning_desc = _pick_attr(z_attrs or {}, [
-            "ZONING_DESC", "ZONING_DESCRIPTION", "ZoningDesc", "Description", "ZONEDESC", "ZONINGDESC"
+            "ZONING_DESC", "ZONING_DESCRIPTION", "ZoningDesc", "Description",
+            "ZONEDESC", "ZONINGDESC", "DISTRICT_DESC", "ZONE_DESC"
         ])
 
-        # Query FLUM polygon at centroid point
-        flum_data = _pinellas_query_layer(
-            PINELLAS_GIS_SERVICES["flum_layer"],
-            {
-                "geometry": f"{x},{y}",
-                "geometryType": "esriGeometryPoint",
-                "inSR": "4326",
-                "spatialRel": "esriSpatialRelIntersects",
-                "outFields": "*",
-                "returnGeometry": "false",
-                "resultRecordCount": 5,
-            },
-        )
+        flum_data = _poly_query(PINELLAS_GIS_SERVICES["flum_layer"])
         f_feats = flum_data.get("features") or []
         f_attrs = (f_feats[0] or {}).get("attributes") if f_feats else {}
 
         flu_code = _pick_attr(f_attrs or {}, [
-            "FLUM", "FLU", "FUTURELANDUSE", "FUTURE_LAND_USE", "CATEGORY", "CLASSNAME", "ClassName"
+            "FLUM", "FLU", "FUTURELANDUSE", "FUTURE_LAND_USE",
+            "CATEGORY", "CLASSNAME", "ClassName"
         ])
         flu_desc = _pick_attr(f_attrs or {}, [
             "FLUM_DESC", "FLU_DESC", "DESCRIPTION", "FutureLandUseDesc", "DESC"
         ])
 
+        debug = {
+            "parcel_field": parcel_res.get("field"),
+            "parcel_where": parcel_res.get("where"),
+            "parcel_sr": sr,
+            "zoning_feature_count": len(z_feats),
+            "flum_feature_count": len(f_feats),
+        }
+
         if not any([zoning_code, zoning_desc, flu_code, flu_desc]):
-            return {"success": False, "error": "No zoning/FLU returned from GIS layers"}
+            return {"success": False, "error": "No zoning/FLU returned from GIS layers", "_debug": debug}
 
         return {
             "success": True,
@@ -642,11 +671,13 @@ def pinellas_lookup_zoning_flu_via_parcel_geometry(parcel_id):
             "zoning_description": str(zoning_desc) if zoning_desc is not None else "",
             "future_land_use": str(flu_code) if flu_code is not None else "",
             "future_land_use_description": str(flu_desc) if flu_desc is not None else "",
-            "_gis_source": "pinellascounty.org ArcGIS (parcel geometry)",
+            "_gis_source": "pinellascounty.org ArcGIS (parcel polygon)",
+            "_debug": debug,
         }
 
     except Exception as e:
         return {"success": False, "error": f"GIS zoning/FLU lookup error: {str(e)}"}
+
 
 # ============================================================================
 # PCPAO API LOOKUP (THE KEY FUNCTION!)
@@ -1963,7 +1994,7 @@ with tabs[0]:
                 st.error("Zoning/FLU lookup is only implemented for Pinellas County right now.")
             else:
                 with st.spinner(f"Fetching zoning/FLU for {address}..."):
-                    zoning_result = lookup_pinellas_zoning(city, address)
+                    zoning_result = lookup_pinellas_zoning(city, address, parcel_data={'parcel_id': intake.get('parcel_id','')})
 
                 if zoning_result.get("success"):
                     intake["zoning_code"] = zoning_result.get("zoning_code") or ""
@@ -1984,7 +2015,11 @@ with tabs[0]:
                     st.success("Zoning/FLU data retrieved.")
                     st.rerun()
                 else:
-                    st.warning(f"Zoning/FLU lookup failed: {zoning_result.get('error','Unknown error')}")
+                    st.error(f"Zoning/FLU lookup failed: {zoning_result.get('error','Unknown error')}")
+                    dbg = zoning_result.get("_debug")
+                    if dbg:
+                        with st.expander("Debug details"):
+                            st.json(dbg)
 
 
 
